@@ -1,140 +1,127 @@
-export type PetBehavior = 'idle' | 'walk' | 'fetch';
+import { clamp, damp } from '../core/math/motion';
+import { vec2 } from '../core/math/vec2';
+import { PetSimulation, type FetchPhase, type PetBehavior, type PointerState } from '../core/PetSimulation';
+import { PointerInput, type ThrowGesture } from '../input/PointerInput';
+import { ThreeRenderer } from '../render/ThreeRenderer';
+import type { PetRenderer } from '../render/types';
 
+export type { PetBehavior } from '../core/PetSimulation';
+
+/**
+ * Connects the simulation, renderer and input layers to the browser.
+ *
+ *   PointerInput (DOM) --> PetEngine (picking, gestures) --> PetSimulation (pure TS)
+ *                                                       --> ThreeRenderer (WebGL)
+ *
+ * Owns the requestAnimationFrame loop and every browser resource (listeners, rAF handle,
+ * WebGL context), and releases all of them in `destroy()`.
+ */
 export class PetAnimationEngine {
-  private canvas: HTMLCanvasElement;
-  private ctx: CanvasRenderingContext2D;
-  private activeBehavior: PetBehavior = 'idle';
+  readonly simulation: PetSimulation;
+  private readonly renderer: PetRenderer;
+  private readonly input: PointerInput;
+
   private animationFrameId: number | null = null;
-  private lastTime: number = 0;
+  private lastTime: number | null = null;
+  private fps = 60;
+  private debug = false;
 
-  // Track the mouse coordinate vector for tracking and fetch positioning
-  private targetCoordinates = { x: 300, y: 200 };
+  // Reused every frame (no allocation in the loop).
+  private readonly groundPointer: PointerState = { x: 0, z: 0, active: false };
+  private readonly aim = vec2();
+  private readonly drawOptions = { debug: false, fps: 60, aim: this.aim, aimVisible: false };
 
-  // Base positional coordinates for the pet object rigging anchor
-  private petRigAnchor = {
-    x: 300,
-    y: 300,
-    radius: 25,
-    rotationAngle: 0,
-    headOffset: { x: 0, y: -40 }
+  /** Called whenever the behaviour or fetch phase changes (e.g. to highlight UI buttons). */
+  onBehaviorChange?: (behavior: PetBehavior, phase: FetchPhase) => void;
+
+  /** Throws if WebGL is unavailable; the caller should show a fallback message. */
+  constructor(canvas: HTMLCanvasElement) {
+    this.simulation = new PetSimulation();
+    this.simulation.onBehaviorChange = (b, p) => this.onBehaviorChange?.(b, p);
+    this.renderer = new ThreeRenderer(canvas, this.simulation.yard);
+    this.input = new PointerInput(canvas);
+    this.input.onGesture = this.onGesture;
+
+    window.addEventListener('resize', this.onResize);
+    document.addEventListener('visibilitychange', this.onVisibilityChange);
+    this.start();
+  }
+
+  setBehavior(behavior: PetBehavior): void {
+    this.simulation.setBehavior(behavior);
+  }
+
+  setDebug(enabled: boolean): void {
+    this.debug = enabled;
+  }
+
+  destroy(): void {
+    this.stop();
+    this.input.dispose();
+    this.renderer.dispose();
+    window.removeEventListener('resize', this.onResize);
+    document.removeEventListener('visibilitychange', this.onVisibilityChange);
+    this.simulation.onBehaviorChange = undefined;
+  }
+
+  private start(): void {
+    if (this.animationFrameId !== null) return;
+    this.lastTime = null; // the first frame after (re)starting gets dt = 0, not the pause length
+    this.animationFrameId = requestAnimationFrame(this.frame);
+  }
+
+  private stop(): void {
+    if (this.animationFrameId !== null) cancelAnimationFrame(this.animationFrameId);
+    this.animationFrameId = null;
+  }
+
+  // Bound once; passing the same function to rAF each frame avoids allocating a closure per frame.
+  private readonly frame = (timestamp: number): void => {
+    const dt = this.lastTime === null ? 0 : (timestamp - this.lastTime) / 1000;
+    this.lastTime = timestamp;
+    if (dt > 0) this.fps = damp(this.fps, 1 / dt, 4, dt);
+
+    // Project the screen pointer onto the ground for the pet's gaze and the aim marker.
+    const screen = this.input.state;
+    const hit = screen.active && this.renderer.pickGround(screen.ndcX, screen.ndcY, this.aim);
+    this.groundPointer.active = hit;
+    this.groundPointer.x = this.aim.x;
+    this.groundPointer.z = this.aim.y;
+
+    this.simulation.update(dt, this.groundPointer);
+
+    this.drawOptions.debug = this.debug;
+    this.drawOptions.fps = this.fps;
+    this.drawOptions.aimVisible = hit;
+    this.renderer.draw(this.simulation, this.drawOptions);
+
+    this.animationFrameId = requestAnimationFrame(this.frame);
   };
 
-  constructor(canvas: HTMLCanvasElement) {
-    this.canvas = canvas;
-    const context = canvas.getContext('2d');
-    if (!context) throw new Error('Could not acquire 2D canvas context');
-    this.ctx = context;
-
-    this.initEventListeners();
-    this.startLoop();
-  }
-
-  private initEventListeners() {
-    // Dynamically map relative canvas cursor coordinates across screen sizes
-    this.canvas.addEventListener('mousemove', (event) => {
-      const rect = this.canvas.getBoundingClientRect();
-      this.targetCoordinates.x = event.clientX - rect.left;
-      this.targetCoordinates.y = event.clientY - rect.top;
-    });
-  }
-
-  public setBehavior(behavior: PetBehavior) {
-    this.activeBehavior = behavior;
-    console.log(`Switched pet execution pipeline to: ${behavior}`);
-    // Candidate hint: Initializing triggers for transitional math vectors could occur here
-  }
-
-  private startLoop() {
-    this.lastTime = performance.now();
-    const renderStep = (timestamp: number) => {
-      // Calculate delta time step to preserve variable frame-rate limits (60Hz vs 120Hz screens)
-      const deltaTime = (timestamp - this.lastTime) / 1000;
-      this.lastTime = timestamp;
-
-      this.update(deltaTime);
-      this.draw();
-
-      this.animationFrameId = requestAnimationFrame(renderStep);
-    };
-    this.animationFrameId = requestAnimationFrame(renderStep);
-  }
-
   /**
-   * TASK FOR CANDIDATE:
-   * Process all vector calculations, easing steps, and joint matrices here.
+   * Tap (or slow drag): throw to the ground point under the pointer.
+   * Flick: throw with the swipe's velocity. Swiping up throws away from the camera, sideways
+   * swipes add sideways speed, and a faster swipe throws further and higher.
    */
-  private update(deltaTime: number) {
-    // Boilerplate default movement: Make the target coordinates slightly guide body orientation
-    // Candidate needs to overwrite this with precise image-mesh rigging / inverse kinematics logic
-    if (this.activeBehavior === 'walk') {
-      this.petRigAnchor.x += Math.sin(performance.now() * 0.005) * 2;
+  private readonly onGesture = (gesture: ThrowGesture): void => {
+    if (gesture.kind === 'tap') {
+      if (this.renderer.pickGround(gesture.ndcX, gesture.ndcY, this.aim)) {
+        this.simulation.throwTo(this.aim.x, this.aim.y);
+      }
+      return;
     }
-  }
+    const forward = clamp(-gesture.vy, 0.4, 4.5); // canvas-heights/s, up is "away"
+    const sideways = clamp(gesture.vx, -4, 4);
+    this.simulation.throwWithVelocity(sideways * 220, 330 + forward * 90, -forward * 260);
+  };
 
-  /**
-   * TASK FOR CANDIDATE:
-   * Draw structural components, apply coordinate matrices, and render assets.
-   */
-  private draw() {
-    // 1. Wipe the viewport clean each frame step
-    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+  private readonly onResize = (): void => {
+    this.renderer.resize(); // devicePixelRatio changes with browser zoom or moving between monitors
+  };
 
-    // 2. Render background ambient grid mapping
-    this.drawDebugGrid();
-
-    // 3. Render tracking target crosshair point (The mouse/ball coordinates)
-    this.ctx.beginPath();
-    this.ctx.arc(this.targetCoordinates.x, this.targetCoordinates.y, 6, 0, Math.PI * 2);
-    this.ctx.fillStyle = this.activeBehavior === 'fetch' ? '#f59e0b' : '#38bdf8';
-    this.ctx.fill();
-
-    // 4. Render primitive dummy pet components (Candidate will map image deformations over this layer)
-    const { x, y, radius, headOffset } = this.petRigAnchor;
-
-    // Draw Body anchor
-    this.ctx.beginPath();
-    this.ctx.arc(x, y, radius, 0, Math.PI * 2);
-    this.ctx.fillStyle = '#475569';
-    this.ctx.fill();
-    this.ctx.lineWidth = 3;
-    this.ctx.strokeStyle = '#94a3b8';
-    this.ctx.stroke();
-
-    // Draw Head anchor skeleton node
-    this.ctx.beginPath();
-    this.ctx.arc(x + headOffset.x, y + headOffset.y, radius * 0.7, 0, Math.PI * 2);
-    this.ctx.fillStyle = '#64748b';
-    this.ctx.fill();
-    this.ctx.stroke();
-
-    // Render configuration text readout directly into canvas metadata overlay
-    this.ctx.fillStyle = '#475569';
-    this.ctx.font = '12px monospace';
-    this.ctx.fillText(`State: ${this.activeBehavior.toUpperCase()}`, 15, 25);
-  }
-
-  private drawDebugGrid() {
-    this.ctx.strokeStyle = '#1e293b';
-    this.ctx.lineWidth = 1;
-    const gridSize = 40;
-
-    for (let x = 0; x < this.canvas.width; x += gridSize) {
-      this.ctx.beginPath();
-      this.ctx.moveTo(x, 0);
-      this.ctx.lineTo(x, this.canvas.height);
-      this.ctx.stroke();
-    }
-    for (let y = 0; y < this.canvas.height; y += gridSize) {
-      this.ctx.beginPath();
-      this.ctx.moveTo(0, y);
-      this.ctx.lineTo(this.canvas.width, y);
-      this.ctx.stroke();
-    }
-  }
-
-  public destroy() {
-    if (this.animationFrameId) {
-      cancelAnimationFrame(this.animationFrameId);
-    }
-  }
+  // Don't burn battery in a background tab; resume cleanly when visible again.
+  private readonly onVisibilityChange = (): void => {
+    if (document.hidden) this.stop();
+    else this.start();
+  };
 }

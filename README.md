@@ -1,5 +1,18 @@
 # Creative Frontend Engineering Challenge: Interactive Pet Canvas
 
+> ## 🐶 Submission: blocky 3D pet with throw-and-fetch
+>
+> **Play:** click the grass to throw the ball there, or flick / swipe up to throw it. The pup runs to where the ball will land, catches it (in mid-air if it can reach), brings it back to your carpet and drops it at your feet. Its head and eyes follow your cursor.
+>
+> - **Live demo:** _add your GitHub Pages URL here after the first deploy_
+> - **How it works:** see [ARCHITECTURE.md](ARCHITECTURE.md) (structure, joint-vector maths, smooth-animation strategy)
+> - **Stack:** TypeScript + Vite + three.js (WebGL). Procedural pixel-art textures, no image assets.
+> - **Scripts:** `npm run dev` · `npm test` (53 tests) · `npm run build`
+> - **Controls:** Idle / Sit / Go for Walk / Play Fetch (random throw). Press **D** to show the IK rig, targets and predicted landing spot.
+> - **Deploy:** pushing to `main` runs `.github/workflows/deploy.yml` (tests, build, GitHub Pages). In the repo settings, set Pages → Source to "GitHub Actions".
+
+---
+
 Welcome! The goal of this take-home challenge is to evaluate your skills in real-time browser graphics, asset rigging, and vector transformations using an HTML5 Canvas workspace.
 
 ## The Task
